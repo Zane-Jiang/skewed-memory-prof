@@ -3,6 +3,9 @@
 import re
 import sys
 from collections import defaultdict
+import matplotlib.pyplot as plt
+import numpy as np
+import os
 
 class Variable:
     def __init__(self, var_id, ptr, location, size, alloc_ts, free_ts):
@@ -56,17 +59,70 @@ def load_variables(alloc_file):
     return variables
 
 def parse_perf_line(line):
-    match = re.match(r'.*\s(\d+)\.(\d+):\s+\d+\s+cpu/mem-(loads|stores)', line)
-    if match:
-        ts_sec = int(match.group(1))
-        ts_usec = int(match.group(2))
-        access_type = match.group(3)
-        timestamp = ts_sec * 1000 + ts_usec // 1000  # convert to ms
-        addr_match = re.search(r'([0-9a-f]{12,16})', line)
-        if addr_match:
-            addr = int(addr_match.group(1), 16)
-            return timestamp, addr, access_type
-    return None
+    match = re.match(r'.*\s(\d+)\.(\d+):', line)
+    if not match:
+        return None
+    ts_sec = int(match.group(1))
+    ts_usec = int(match.group(2))
+    timestamp = ts_sec * 1000 + ts_usec // 1000  # ms
+    addr_match = re.search(r'([0-9a-f]{12,16})', line)
+    if not addr_match:
+        return None
+    addr = int(addr_match.group(1), 16)
+    if '|OP LOAD|' in line:
+        access_type = 'load'
+    elif '|OP STORE|' in line:
+        access_type = 'store'
+    else:
+        return None
+    return timestamp, addr, access_type
+
+def plot_variable_access_heat(variables, output_prefix):
+    # 直接在bar_plots下存放图片
+    bar_dir = os.path.join(output_prefix,'bar_plots');
+    os.makedirs(bar_dir, exist_ok=True)
+    for var in variables:
+        if var.access_count == 0:
+            continue
+        addrs = []
+        counts = []
+        for addr in range(var.start_addr, var.end_addr):
+            cnt = var.addr_stats[addr]['total'] if addr in var.addr_stats else 0
+            addrs.append(addr - var.start_addr)
+            counts.append(cnt)
+        plt.figure(figsize=(10, 4))
+        plt.bar(addrs, counts, width=1.0)
+        plt.xlabel('Offset in Variable (Byte)')
+        plt.ylabel('Access Count')
+        plt.title(f'Variable {var.var_id} @ {hex(var.start_addr)} Access Heat')
+        plt.tight_layout()
+        plt.savefig(os.path.join(bar_dir, f'var_{var.var_id}_bar.png'))
+        plt.close()
+
+def plot_variable_access_colormap(variables, output_prefix):
+    # 直接在heatmaps下存放图片
+    heatmap_dir =  os.path.join(output_prefix,'heatmaps');
+    os.makedirs(heatmap_dir, exist_ok=True)
+    for var in variables:
+        if var.access_count == 0:
+            continue
+        # 先整体初始化为最冷色（如0）
+        counts = np.zeros(var.size)
+        # 只对有访问的地址赋热度
+        for addr, stats in var.addr_stats.items():
+            offset = addr - var.start_addr
+            if 0 <= offset < var.size:
+                counts[offset] = stats['total']
+        counts = counts.reshape(-1, 1)  # 纵向色块
+        plt.figure(figsize=(2, 8))
+        plt.imshow(counts, aspect='auto', cmap='coolwarm', origin='lower')
+        plt.colorbar(label='Access Count')
+        plt.title(f'Var {var.var_id}\n{hex(var.start_addr)} ~ {hex(var.end_addr-1)}\nLife: {var.alloc_ts}~{var.free_ts}')
+        plt.xlabel('Variable')
+        plt.ylabel('Offset (Byte)')
+        plt.tight_layout()
+        plt.savefig(os.path.join(eatmap_dir, f'var_{var.var_id}_heatmap.png'))
+        plt.close()
 
 def analyze(perf_file, alloc_file, output_file):
     variables = load_variables(alloc_file)
@@ -94,6 +150,9 @@ def analyze(perf_file, alloc_file, output_file):
             out.write('Accessed Address\tTotal\tLoads\tStores\n')
             for addr, stats in sorted(var.addr_stats.items()):
                 out.write(f'{hex(addr)}\t{stats["total"]}\t{stats["load"]}\t{stats["store"]}\n')
+
+    plot_variable_access_heat(variables, "result")
+    plot_variable_access_colormap(variables, "result")
 
 
 if __name__ == '__main__':

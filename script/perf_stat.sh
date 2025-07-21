@@ -18,12 +18,23 @@ fi
   dir=$(basename "$program")
   init_output_dir "$dir"
 
-perf record \
-  -e cpu/mem-loads/P \
-  -e cpu/mem-stores/ \
-  -c 1 \
+  # -e cpu/mem-loads/P \
+  # -e cpu/mem-stores/ \
+  
+  # -e mem_load_retired.l1_hit\
+  # -e mem_load_retired.l1_miss\
+  # -e r81D0 -e r82D0\
+perf mem record -a \
   -o "$OUT_RAW_DIR/"$dir"/raw.data" \
   -- "$program" "$@"
+
+# perf record \
+  # -e cpu/mem-loads/P \
+  # -e cpu/mem-stores/ \
+  # -a\
+  # -c 1\
+  # -o "$OUT_RAW_DIR/"$dir"/raw.data" \
+  # -- "$program" "$@"
 
   perf script -i "$OUT_RAW_DIR/"$dir"/raw.data" > "$OUT_RAW_DIR/"$dir"/raw.txt"
   echo "[INFO] perf data collected."
