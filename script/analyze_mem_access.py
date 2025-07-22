@@ -82,55 +82,68 @@ def plot_variable_access_heat(variables, output_prefix):
     import glob
     bar_dir = os.path.join(output_prefix, 'bar_plots')
     os.makedirs(bar_dir, exist_ok=True)
-    # 清空旧图
     for f in glob.glob(os.path.join(bar_dir, '*.png')):
         os.remove(f)
     for idx, var in enumerate(variables):
         if var.access_count == 0:
             continue
-        offsets = []
-        counts = []
-        for addr, stats in var.addr_stats.items():
-            offset = addr - var.start_addr
-            if 0 <= offset < var.size:
-                offsets.append(offset)
-                counts.append(stats['total'])
-        offsets, counts = zip(*sorted(zip(offsets, counts))) if offsets else ([],[])
-        plt.figure(figsize=(10, 4))
-        plt.bar(offsets, counts, width=1.0)
+        max_bins = 1024
+        if var.size <= max_bins:
+            offsets = []
+            counts = []
+            for addr, stats in var.addr_stats.items():
+                offset = addr - var.start_addr
+                if 0 <= offset < var.size:
+                    offsets.append(offset)
+                    counts.append(int(stats['total']))
+            offsets, counts = zip(*sorted(zip(offsets, counts))) if offsets else ([],[])
+            plt.figure(figsize=(10, 4))
+            plt.bar(offsets, counts, width=1.0)
+            plt.xlim(0, var.size)
+            x_ticks = [0]
+            if var.size > 10:
+                step = var.size // 10
+                x_ticks.extend([i*step for i in range(1, 10)])
+            x_ticks.append(var.size)
+            plt.xticks(x_ticks)
+            x_labels = [f"{int(x)}" for x in x_ticks]
+            x_labels[-1] = f"{int(x_ticks[-1])}\n({hex(var.end_addr)})"
+            plt.gca().set_xticklabels(x_labels)
+        else:
+            bin_size = var.size // max_bins + (1 if var.size % max_bins else 0)
+            bin_counts = [0] * max_bins
+            for addr, stats in var.addr_stats.items():
+                offset = addr - var.start_addr
+                if 0 <= offset < var.size:
+                    bin_idx = min(offset // bin_size, max_bins-1)
+                    bin_counts[bin_idx] += int(stats['total'])
+            bin_offsets = [i*bin_size for i in range(max_bins)]
+            plt.figure(figsize=(12, 4))
+            plt.bar(bin_offsets, bin_counts, width=bin_size)
+            plt.xlim(0, var.size)
+            x_ticks = [0]
+            n_labels = 10
+            step = max_bins // (n_labels-2)
+            x_ticks.extend([i*bin_size for i in range(step, max_bins, step)])
+            x_ticks.append(var.size)
+            plt.xticks(x_ticks)
+            x_labels = [f"{int(x)}" for x in x_ticks]
+            x_labels[-1] = f"{int(x_ticks[-1])}\n({hex(var.end_addr)})"
+            plt.gca().set_xticklabels(x_labels)
         plt.xlabel('Offset in Variable (Byte)')
         plt.ylabel('Access Count')
         plt.title(f'Variable {var.var_id} @ {hex(var.start_addr)} Access Heat')
-        plt.tight_layout()
+        # 保证y轴为整数且可见
+        if counts if var.size <= max_bins else bin_counts:
+            ymax = max(counts) * 1.1 if var.size <= max_bins else max(bin_counts) * 1.1
+            plt.ylim(0, ymax)
+            plt.yticks(range(0, int(ymax)+1, max(1, int(ymax)//8)))
+        # 添加总访问次数和变量大小文本
+        total_accesses = var.access_count
+        size_mb = var.size / (1024*1024)
+        plt.figtext(0.5, 0.01, f"Total Accesses: {total_accesses}, Size: {size_mb:.3f} MB", ha="center", fontsize=12, bbox={"facecolor":"orange", "alpha":0.2, "pad":5})
+        plt.tight_layout(rect=[0, 0.05, 1, 1])
         out_path = os.path.join(bar_dir, f'var_{var.var_id}_bar.png')
-        plt.savefig(out_path)
-        plt.close()
-
-def plot_variable_access_colormap(variables, output_prefix):
-    import time
-    import glob
-    heatmap_dir = os.path.join(output_prefix, 'heatmaps')
-    os.makedirs(heatmap_dir, exist_ok=True)
-    for f in glob.glob(os.path.join(heatmap_dir, '*.png')):
-        os.remove(f)
-    for idx, var in enumerate(variables):
-        if var.access_count == 0:
-            continue
-        offsets = []
-        counts = []
-        for addr, stats in var.addr_stats.items():
-            offset = addr - var.start_addr
-            if 0 <= offset < var.size:
-                offsets.append(offset)
-                counts.append(stats['total'])
-        plt.figure(figsize=(8, 4))
-        plt.scatter([0]*len(offsets), offsets, c=counts, cmap='coolwarm', marker='s', s=8, linewidths=0)
-        plt.colorbar(label='Access Count')
-        plt.title(f'Var {var.var_id}\n{hex(var.start_addr)} ~ {hex(var.end_addr-1)}\nLife: {var.alloc_ts}~{var.free_ts}')
-        plt.xlabel('Variable')
-        plt.ylabel('Offset (Byte)')
-        plt.tight_layout()
-        out_path = os.path.join(heatmap_dir, f'var_{var.var_id}_heatmap.png')
         plt.savefig(out_path)
         plt.close()
 
@@ -162,7 +175,6 @@ def analyze(perf_file, alloc_file, output_file):
                 out.write(f'{hex(addr)}\t{stats["total"]}\t{stats["load"]}\t{stats["store"]}\n')
 
     plot_variable_access_heat(variables, "result")
-    plot_variable_access_colormap(variables, "result")
 
 
 if __name__ == '__main__':
