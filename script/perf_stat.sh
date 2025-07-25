@@ -23,18 +23,24 @@ fi
 
   perf script -i "$OUT_RAW_DIR/"$dir"/raw.data" > "$OUT_RAW_DIR/"$dir"/raw.txt"
   echo "[INFO] perf data collected."
+  mkdir -p result
+  python3 /home/jz/PCXL/benchmark/skewed-memory-prof/script/analyze_mem_load_store.py "$OUT_RAW_DIR/"$dir"/raw.txt" "$HEAP_PROF_PATH" "result/"$dir".txt"
 }
 
-perf_collect_cycle_activity_stall_l3_miss() {
+perf_collect_l3_store_miss() {
   local program="$1"
   shift
   if [ "$(id -u)" -ne 0 ]; then
     echo "Warning: You are not root. Some events may be missing."
   fi
-  echo "[INFO] Starting [cycle_activity_stall_l3_miss] profiling..."
+  echo "[INFO] Starting [l3_store_miss] profiling..."
   dir=$(basename "$program")
   init_output_dir "$dir"
-  perf record -e CYCLE_ACTIVITY.STALLS_L3_MISS -a -o "$OUT_RAW_DIR/"$dir"/raw.data" -- "$program" "$@"
-  perf script -i "$OUT_RAW_DIR/"$dir"/raw.data" > "$OUT_RAW_DIR/"$dir"/raw.txt"
+  perf record -e mem_load_retired.l3_miss:P  -d -o "$OUT_RAW_DIR/"$dir"/raw.data" -- "$program" "$@"
+  perf script -i "$OUT_RAW_DIR/"$dir"/raw.data"  -F comm,time,event,sym,addr >  "$OUT_RAW_DIR/"$dir"/raw.txt"
   echo "[INFO] perf data collected."
+  mkdir -p result
+  python3 /home/jz/PCXL/benchmark/skewed-memory-prof/script/analyze_l3_store_miss.py "$OUT_RAW_DIR/"$dir"/raw.txt" "$HEAP_PROF_PATH" "result/"$dir".txt"
 }
+
+
