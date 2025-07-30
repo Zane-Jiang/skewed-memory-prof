@@ -29,7 +29,7 @@ fi
   # -o "$OUT_RAW_DIR/"$dir"/raw.data" \
   # -- "$program" "$@"
 
-
+# 
   perf script -i "$OUT_RAW_DIR/"$dir"/raw.data" > "$OUT_RAW_DIR/"$dir"/raw.txt"
   echo "[INFO] perf data collected."
   mkdir -p result

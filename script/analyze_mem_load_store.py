@@ -263,6 +263,76 @@ def analyze(perf_file, alloc_file, output_file):
             for addr, stats in sorted(var.addr_stats.items()):
                 out.write(f'{hex(addr)}\t{stats["total"]}\t{stats["load"]}\t{stats["store"]}\n')
     plot_variable_access_heat(variables, "result")
+    plot_all_variables_access_cdf(variables, "result")
+
+def plot_all_variables_access_cdf(variables, output_prefix):
+    import time
+    import os
+
+    os.makedirs(output_prefix, exist_ok=True)
+    out_path = os.path.join(output_prefix, 'all_vars_cdf.png')
+
+    print(f"[INFO] Generating combined CDF plot for all variables...")
+
+    plt.figure(figsize=(10, 6))
+    page_size = 4 * 1024
+
+    for idx, var in enumerate(variables):
+        if var.access_count == 0:
+            continue
+
+        num_pages = (var.size + page_size - 1) // page_size
+        page_accesses = [0] * num_pages
+
+        for addr, stats in var.addr_stats.items():
+            offset = addr - var.start_addr
+            if 0 <= offset < var.size:
+                page_idx = offset // page_size
+                page_accesses[page_idx] += stats['total']
+
+        sorted_accesses = sorted(page_accesses, reverse=True)
+        total_access = sum(sorted_accesses)
+        if total_access == 0:
+            continue
+
+        num_pages = len(sorted_accesses)
+        page_percent = np.concatenate([[0], np.arange(1, num_pages + 1) / num_pages * 100])
+        cumsum_access_percent = np.concatenate([[0], np.cumsum(sorted_accesses) / total_access * 100])
+     
+
+        label = f'Var {var.var_id} ({var.size//1024}KB)'
+        plt.plot(page_percent, cumsum_access_percent, label=label, linewidth=1.5)
+        
+        debug_dir = os.path.join(output_prefix, "page_debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_file = os.path.join(debug_dir, f'var_{var.var_id}_pages.txt')
+
+        with open(debug_file, 'w') as df:
+            df.write(f'# Variable {var.var_id}, Size={var.size} bytes, Pages={num_pages}\n')
+            df.write('Page_Index_Sorted\tAccess_Count\tAccess_Percent\n')
+            for rank, count in enumerate(sorted_accesses):
+                percent = count / total_access * 100
+                df.write(f'{rank}\t{count}\t{percent:.2f}\n')
+
+    plt.xlim(0, 100)
+    plt.ylim(0, 100)
+    plt.xticks(np.arange(0, 110, 10))
+    plt.yticks(np.arange(0, 110, 10))
+    plt.xlabel('Page Percentage (Sorted by Access Count Desc)', fontsize=12)
+    plt.ylabel('Cumulative Access Percentage', fontsize=12)
+    plt.title('Access Distribution CDF per Variable', fontsize=14)
+    plt.grid(True)
+    plt.legend(loc='lower right', fontsize=10, framealpha=0.7)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+
+
+
+    print(f"[INFO] Saved combined CDF plot to {out_path}")
+
 
 if __name__ == '__main__':
     if len(sys.argv) != 4:
