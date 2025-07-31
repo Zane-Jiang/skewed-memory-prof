@@ -19,17 +19,11 @@ fi
   # -c 100
 
   echo 3000000 > /proc/sys/kernel/perf_event_max_sample_rate
-  perf mem record -a \
+  perf mem record  \
   -o "$OUT_RAW_DIR/"$dir"/raw.data" \
   -- "$program" "$@"
 
-  # perf mem -e mem-loads,mem-stores -a \
-  # -j any,u\
-  # -c 100 \
-  # -o "$OUT_RAW_DIR/"$dir"/raw.data" \
-  # -- "$program" "$@"
 
-# 
   perf script -i "$OUT_RAW_DIR/"$dir"/raw.data" > "$OUT_RAW_DIR/"$dir"/raw.txt"
   echo "[INFO] perf data collected."
   mkdir -p result

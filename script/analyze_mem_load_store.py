@@ -239,16 +239,32 @@ def plot_variable_access_heat(variables, output_prefix):
 
     print(f"\n[INFO] Finished generating all plots in {time.time() - total_start_time:.3f}s.")
 
+
+sys.path.append('/home/jz/.local/lib/python3.13/site-packages')
+from intervaltree import IntervalTree
+
+def build_interval_tree(variables):
+    tree = IntervalTree()
+    for var in variables:
+        if var.size > 0: 
+            tree[var.start_addr:var.end_addr] = var
+    return tree
+
 def analyze(perf_file, alloc_file, output_file):
+    total_start_time = time.time()
     variables = load_variables(alloc_file)
+    interval_tree = build_interval_tree(variables)
+
     with open(perf_file, 'r') as f:
         for line in f:
             parsed = parse_perf_line(line)
             if parsed:
                 ts, addr, access_type = parsed
-                for var in variables:
-                    if var.in_lifetime(ts) and var.contains(addr):
+                for iv in interval_tree[addr]:
+                    var = iv.data
+                    if var.in_lifetime(ts):
                         var.record_access(addr, access_type)
+    print(f"[INFO] Finished analyzing memory access in {time.time() - total_start_time:.3f}s.")
     with open(output_file, 'w') as out:
         out.write('===== Summary: Variable Memory Access Statistics =====\n')
         out.write('Start Address\tSize(Bytes)\tLifetime(ms)\tTotal Accesses\tLoad Count\tStore Count\n')
@@ -300,7 +316,7 @@ def plot_all_variables_access_cdf(variables, output_prefix):
         cumsum_access_percent = np.concatenate([[0], np.cumsum(sorted_accesses) / total_access * 100])
      
 
-        label = f'Var {var.var_id} ({var.size//1024}KB)'
+        label = f'Var {var.var_id}{var.location}({var.size//1024}KB)'
         plt.plot(page_percent, cumsum_access_percent, label=label, linewidth=1.5)
         
         debug_dir = os.path.join(output_prefix, "page_debug")
