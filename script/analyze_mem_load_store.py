@@ -89,12 +89,12 @@ def plot_variable_access_heat(variables, output_prefix):
     for f in glob.glob(os.path.join(bar_dir, '*.png')):
         os.remove(f)
 
+
     for idx, var in enumerate(variables):
         if var.access_count == 0:
             continue
             
         var_start_time = time.time()
-        print(f"\n[{idx+1}/{len(variables)}] Processing variable id={var.var_id}, size={var.size} bytes...")
         
         data_prep_start_time = time.time()
         
@@ -104,49 +104,11 @@ def plot_variable_access_heat(variables, output_prefix):
         very_large_threshold = page_size * max_bins # 4MB
 
         plt.xlabel('Offset in Variable (Byte)')
-
         if var.size <= page_size:
-            # --- Case 1: NO BINNING (<= 4KB) ---
-            print(f"    -> Mode: No binning (size <= {page_size}B).")
-            
-            offsets = []
-            counts = []
-            for addr, stats in var.addr_stats.items():
-                offset = addr - var.start_addr
-                if 0 <= offset < var.size:
-                    offsets.append(offset)
-                    counts.append(int(stats['total']))
-            if offsets:
-                offsets, counts = zip(*sorted(zip(offsets, counts)))
-            else:
-                offsets, counts = [], []
-            
-            print(f"    -> Data preparation took: {time.time() - data_prep_start_time:.3f}s")
-            plotting_start_time = time.time()
+            continue
+        print(f"\n[{idx+1}/{len(variables)}] Processing variable id={var.var_id}, size={var.size} bytes...")
 
-            plt.figure(figsize=(10, 4))
-            plt.bar(offsets, counts, width=1.0)
-            plt.title(f'Variable {var.var_id} @ {hex(var.start_addr)} Access Heat')
-            plt.ylabel('Access Count')
-
-            x_ticks = [0]
-            if var.size > 10:
-                step = var.size // 10
-                x_ticks.extend([i * step for i in range(1, 10)])
-            x_ticks.append(var.size)
-            plt.xticks(sorted(list(set(x_ticks))))
-            x_labels = [f"{int(x)}" for x in plt.gca().get_xticks()]
-            if len(x_labels) > 0:
-                 x_labels[-1] = f"{int(var.size)}\n({hex(var.end_addr)})"
-            plt.gca().set_xticklabels(x_labels)
-            
-            if counts:
-                ymax = max(counts) * 1.1
-                plt.ylim(0, ymax if ymax > 0 else 1)
-                plt.yticks(range(0, int(ymax) + 1, max(1, int(ymax) // 8)))
-
-        elif var.size <= very_large_threshold:
-            # --- Case 2: 4KB PAGE BINNING (>4KB and <=4MB) ---
+        if var.size <= very_large_threshold:
             print(f"    -> Mode: Binning to {page_size//1024}KB pages (size <= {very_large_threshold/1024/1024}MB).")
             
             bin_size = page_size
@@ -185,7 +147,6 @@ def plot_variable_access_heat(variables, output_prefix):
                 plt.yticks(range(0, int(ymax) + 1, max(1, int(ymax) // 8)))
                 
         else:
-            # --- Case 3: 1000-BIN BINNING (>4MB) ---
             print(f"    -> Mode: Binning to {max_bins} bins (size > {very_large_threshold/1024/1024}MB).")
 
             num_bins = max_bins
@@ -228,7 +189,7 @@ def plot_variable_access_heat(variables, output_prefix):
         
         total_accesses = var.access_count
         size_mb = var.size / (1024 * 1024)
-        plt.figtext(0.5, 0.01, f"Total Accesses: {total_accesses}, Size: {size_mb:.3f} MB", ha="center", fontsize=12, bbox={"facecolor": "orange", "alpha": 0.2, "pad": 5})
+        plt.figtext(0.5, 0.01, f"Total Accesses: {total_accesses}, Size: {size_mb:.3f} MB, Location: {var.location}", ha="center", fontsize=12, bbox={"facecolor": "orange", "alpha": 0.2, "pad": 5})
         plt.tight_layout(rect=[0, 0.05, 1, 1])
         out_path = os.path.join(bar_dir, f'var_{var.var_id}_bar.png')
         plt.savefig(out_path)
@@ -251,6 +212,7 @@ def build_interval_tree(variables):
     return tree
 
 def analyze(perf_file, alloc_file, output_file):
+    import time
     total_start_time = time.time()
     variables = load_variables(alloc_file)
     interval_tree = build_interval_tree(variables)
@@ -284,7 +246,7 @@ def analyze(perf_file, alloc_file, output_file):
 def plot_all_variables_access_cdf(variables, output_prefix):
     import time
     import os
-
+    import glob
     os.makedirs(output_prefix, exist_ok=True)
     out_path = os.path.join(output_prefix, 'all_vars_cdf.png')
 
@@ -292,11 +254,16 @@ def plot_all_variables_access_cdf(variables, output_prefix):
 
     plt.figure(figsize=(10, 6))
     page_size = 4 * 1024
+    debug_dir = os.path.join(output_prefix, "page_debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    for f in glob.glob(os.path.join(debug_dir, '*.txt')):
+        os.remove(f)
 
     for idx, var in enumerate(variables):
         if var.access_count == 0:
             continue
-
+        if var.size < page_size:
+            continue
         num_pages = (var.size + page_size - 1) // page_size
         page_accesses = [0] * num_pages
 
@@ -315,12 +282,11 @@ def plot_all_variables_access_cdf(variables, output_prefix):
         page_percent = np.concatenate([[0], np.arange(1, num_pages + 1) / num_pages * 100])
         cumsum_access_percent = np.concatenate([[0], np.cumsum(sorted_accesses) / total_access * 100])
      
-
-        label = f'Var {var.var_id}{var.location}({var.size//1024}KB)'
-        plt.plot(page_percent, cumsum_access_percent, label=label, linewidth=1.5)
+        #label 显示到图的下方，图的大小不固定
+        plt.figtext(0.5, 0.01, f"Var {var.var_id}{var.location}({var.size//1024}KB)", ha="center", fontsize=12, bbox={"facecolor": "orange", "alpha": 0.2, "pad": 5})
+        # label = f'Var {var.var_id}{var.location}({var.size//1024}KB)'
+        plt.plot(page_percent, cumsum_access_percent,  linewidth=1.5)
         
-        debug_dir = os.path.join(output_prefix, "page_debug")
-        os.makedirs(debug_dir, exist_ok=True)
         debug_file = os.path.join(debug_dir, f'var_{var.var_id}_pages.txt')
 
         with open(debug_file, 'w') as df:
