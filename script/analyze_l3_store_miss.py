@@ -52,26 +52,17 @@ def load_variables(alloc_file):
             variables.append(var)
     return variables
 
-def parse_perf_line(line):
+def parse_peb_line(line):
     # Match L3 miss stall events
-    if 'mem_load_retired.l3_miss:P' not in line:
+    if 'pebs:pebs' not in line:
         return None
-        
-    match = re.match(r'.*\s(\d+)\.(\d+):', line)
-    if not match:
-        return None
-        
-    ts_sec = int(match.group(1))
-    ts_usec = int(match.group(2))
-    timestamp = ts_sec * 1000 + ts_usec // 1000  # ms
+
+    arr = re.split(' |,|\n', line)
+    arr = [x for x in arr if len(x) > 0]
     
-    # Extract the accessed address
-    addr_match = re.search(r'([0-9a-f]{12,16})', line)
-    if not addr_match:
-        return None
-        
-    addr = int(addr_match.group(1), 16)
-    return timestamp, addr
+    address = int(arr[8], 16)
+    time = int(arr[10], 16)
+    return time, address
 
 def plot_variable_stall_heat(variables, output_prefix):
     bar_dir = os.path.join(output_prefix, 'l3_stall_plots')
@@ -233,29 +224,29 @@ def plot_variable_stall_heat(variables, output_prefix):
 
     print(f"\n[INFO] Finished generating all plots in {time.time() - total_start_time:.3f}s.")
 
-def analyze(perf_file, alloc_file, output_file):
+def analyze(peb_file, alloc_file, output_file):
     variables = load_variables(alloc_file)
     print(f"[INFO] Loaded {len(variables)} variable records")
     
-    stall_count = 0
-    matched_stall_count = 0
+    peb_count = 0
+    matched_peb_count = 0
     
-    print(f"[INFO] Starting analysis of performance data file: {perf_file}")
-    with open(perf_file, 'r') as f:
+    print(f"[INFO] Starting analysis of performance data file: {peb_file}")
+    with open(peb_file, 'r') as f:
         for line in f:
-            parsed = parse_perf_line(line)
+            parsed = parse_peb_line(line)
             if parsed:
-                stall_count += 1
+                peb_count += 1
                 ts, addr = parsed
                 found = False
                 for var in variables:
                     if var.in_lifetime(ts) and var.contains(addr):
                         var.record_stall(addr)
-                        matched_stall_count += 1
+                        matched_peb_count += 1
                         found = True
                         break
     
-    print(f"[INFO] Analysis complete. Total of {stall_count} L3 miss stall events, {matched_stall_count} matched to variables")
+    print(f"[INFO]Total of {peb_count} peb events, {matched_peb_count} matched to variables")
     
     with open(output_file, 'w') as out:
         out.write('===== L3 Miss Stall Statistics Summary =====\n')
@@ -277,9 +268,9 @@ def analyze(perf_file, alloc_file, output_file):
 
 if __name__ == '__main__':
     if len(sys.argv) != 4:
-        print("Usage: python3 analyze_l3_miss_stall.py <perf_output.txt> <alloc_info.txt> <output.txt>")
+        print("Usage: python3 analyze_l3_miss_stall.py <peb.txt> <alloc_info.txt> <output.txt>")
         sys.exit(1)
-    perf_file = sys.argv[1]
+    peb_file = sys.argv[1]
     alloc_file = sys.argv[2]
     output_file = sys.argv[3]
-    analyze(perf_file, alloc_file, output_file) 
+    analyze(peb_file, alloc_file, output_file) 
