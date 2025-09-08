@@ -8,7 +8,22 @@ import numpy as np
 import os
 import time
 import glob
+from collections import OrderedDict
+import csv
 
+
+PAGE_SIZE = 4*1024
+class Page:
+    def __init__(self,idx,start_addr):
+        self.access_count = 0
+        self.idx = idx
+        self.start_addr = start_addr
+        self.access_ratio = 0.0
+        self.score = 0.0
+        
+    def contains(self,addr):
+        return self.start_addr <= addr <= (self.start_addr+PAGE_SIZE)
+        
 class Variable:
     def __init__(self, var_id, ptr, location, size, alloc_ts, free_ts):
         self.var_id = var_id
@@ -18,8 +33,12 @@ class Variable:
         self.alloc_ts = float(alloc_ts)
         self.free_ts = float(free_ts)
         self.location = location
-        self.stall_count = 0
-        self.addr_stats = defaultdict(int)  # Record L3 miss stall count for each address
+
+        end_pg   = (self.size) // PAGE_SIZE
+        self.pages = []
+        for p in range(0, end_pg + 1):
+            self.pages.append(Page(idx=p, start_addr=self.start_addr + p * PAGE_SIZE))
+
 
     def in_lifetime(self, ts):
         return self.alloc_ts <= ts <= self.free_ts
@@ -27,250 +46,226 @@ class Variable:
     def contains(self, addr):
         return self.start_addr <= addr < self.end_addr
 
-    def record_stall(self, addr):
-        self.stall_count += 1
-        self.addr_stats[addr] += 1
-
-def load_variables(alloc_file):
-    variables = []
-    with open(alloc_file, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line == '' or line.startswith('#'):
-                continue
-            parts = line.split()
-            if len(parts) != 6:
-                continue  # Skip malformed lines
-            var = Variable(
-                var_id=parts[0],
-                ptr=parts[1],
-                location=parts[2],
-                size=parts[3],
-                alloc_ts=parts[4],
-                free_ts=parts[5]
-            )
-            variables.append(var)
-    return variables
-
-def parse_peb_line(line):
-    # Match L3 miss stall events
-    if 'pebs:pebs' not in line:
-        return None
-
-    arr = re.split(' |,|\n', line)
-    arr = [x for x in arr if len(x) > 0]
+events = ["cycles", "CYCLE_ACTIVITY.STALLS_L3_MISS", \
+  "OFFCORE_REQUESTS.DEMAND_DATA_RD", \
+  "OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_DEMAND_DATA_RD"]
+class File_Paser:
+    @staticmethod
+    def load_variables(alloc_file):
+        variables = []
+        with open(alloc_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line == '' or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) != 6:
+                    continue  # Skip malformed lines
+                var = Variable(
+                    var_id=parts[0],
+                    ptr=parts[1],
+                    location=parts[2],
+                    size=parts[3],
+                    alloc_ts=parts[4],
+                    free_ts=parts[5]
+                )
+                variables.append(var)
+        return variables
     
-    address = int(arr[8], 16)
-    time = int(arr[10], 16)
-    return time, address
 
-def plot_variable_stall_heat(variables, output_prefix):
-    bar_dir = os.path.join(output_prefix, 'l3_stall_plots')
-    os.makedirs(bar_dir, exist_ok=True)
-    
-    print(f"[INFO] Starting to generate L3 miss stall heat maps in '{bar_dir}'...")
-    total_start_time = time.time()
+    def __parse_peb_line(line):
+        # Match L3 miss stall events
+        if 'pebs:pebs' not in line:
+            return None
+        arr = re.split(' |,|\n', line)
+        arr = [x for x in arr if len(x) > 0]
+        address = int(arr[8], 16)
+        time = int(arr[10], 16)
+        return time, address
 
-    for f in glob.glob(os.path.join(bar_dir, '*.png')):
-        os.remove(f)
+    @staticmethod
+    def load_pebs_file(variables,peb_file):
+        flow_time_addr = []
+        with open(peb_file, 'r') as f:
+            for line in f:
+                parsed = File_Paser.__parse_peb_line(line)
+                if parsed:
+                    flow_time_addr.append(parsed)
+        return flow_time_addr
 
-    for idx, var in enumerate(variables):
-        if var.stall_count == 0:
-            continue
-            
-        var_start_time = time.time()
-        print(f"\n[{idx+1}/{len(variables)}] Processing variable id={var.var_id}, size={var.size} bytes...")
-        
-        data_prep_start_time = time.time()
-        
-        # Define thresholds
-        page_size = 4 * 1024  # 4KB
-        max_bins = 1000
-        very_large_threshold = page_size * max_bins # 4MB
 
-        plt.xlabel('Offset in Variable (Byte)')
 
-        if var.size <= page_size:
-            # --- Case 1: NO BINNING (<= 4KB) ---
-            print(f"    -> Mode: No binning (size <= {page_size}B).")
-            
-            offsets = []
-            counts = []
-            for addr, count in var.addr_stats.items():
-                offset = addr - var.start_addr
-                if 0 <= offset < var.size:
-                    offsets.append(offset)
-                    counts.append(int(count))
-            if offsets:
-                offsets, counts = zip(*sorted(zip(offsets, counts)))
-            else:
-                offsets, counts = [], []
-            
-            print(f"    -> Data preparation took: {time.time() - data_prep_start_time:.3f}s")
-            plotting_start_time = time.time()
+    @staticmethod 
+    def load_stall_perf_file(file_name):
+        perf_data = OrderedDict()
+        for event in events:
+            perf_data[event] = []
 
-            plt.figure(figsize=(10, 4))
-            plt.bar(offsets, counts, width=1.0)
-            plt.title(f'Variable {var.var_id} @ {hex(var.start_addr)} L3 Miss Stall Heat Map')
-            plt.ylabel('L3 Miss Stall Count')
-
-            x_ticks = [0]
-            if var.size > 10:
-                step = var.size // 10
-                x_ticks.extend([i * step for i in range(1, 10)])
-            x_ticks.append(var.size)
-            plt.xticks(sorted(list(set(x_ticks))))
-            x_labels = [f"{int(x)}" for x in plt.gca().get_xticks()]
-            if len(x_labels) > 0:
-                 x_labels[-1] = f"{int(var.size)}\n({hex(var.end_addr)})"
-            plt.gca().set_xticklabels(x_labels)
-            
-            if counts:
-                ymax = max(counts) * 1.1
-                plt.ylim(0, ymax if ymax > 0 else 1)
-                plt.yticks(range(0, int(ymax) + 1, max(1, int(ymax) // 8)))
-
-        elif var.size <= very_large_threshold:
-            # --- Case 2: 4KB PAGE BINNING (>4KB and <=4MB) ---
-            print(f"    -> Mode: Binning to {page_size//1024}KB pages (size <= {very_large_threshold/1024/1024}MB).")
-            
-            bin_size = page_size
-            num_bins = (var.size + bin_size - 1) // bin_size
-            bin_counts = [0] * num_bins
-            for addr, count in var.addr_stats.items():
-                offset = addr - var.start_addr
-                if 0 <= offset < var.size:
-                    bin_idx = offset // bin_size
-                    bin_counts[bin_idx] += int(count)
-            
-            print(f"    -> Data preparation took: {time.time() - data_prep_start_time:.3f}s")
-            plotting_start_time = time.time()
-
-            bin_offsets = [i * bin_size for i in range(num_bins)]
-            plt.figure(figsize=(12, 4))
-            plt.bar(bin_offsets, bin_counts, width=bin_size, align='edge')
-            
-            plt.title(f'Variable {var.var_id} @ {hex(var.start_addr)} L3 Miss Stall Heat Map ({bin_size//1024}KB Bins)')
-            plt.ylabel('L3 Miss Stall Count per 4KB Page')
-            
-            x_ticks = [0]
-            if num_bins > 1:
-                step = max(1, num_bins // 10)
-                x_ticks.extend([i * bin_size for i in range(step, num_bins, step)])
-            x_ticks.append(var.size)
-            plt.xticks(sorted(list(set(x_ticks))))
-            x_labels = [f"{int(x/1024)}K" for x in plt.gca().get_xticks()]
-            if len(x_labels) > 0:
-                x_labels[-1] = f"{int(var.size/1024)}K\n({hex(var.end_addr)})"
-            plt.gca().set_xticklabels(x_labels)
-
-            if any(bin_counts):
-                ymax = max(bin_counts) * 1.1
-                plt.ylim(0, ymax if ymax > 0 else 1)
-                plt.yticks(range(0, int(ymax) + 1, max(1, int(ymax) // 8)))
+        with open(file_name) as csv_file:
+        # Process the file content here
+            csv_header = csv.reader(csv_file, delimiter=' ')
+            line_count = 0
+            for row in csv_header:
+                line_count += 1
+                processed_row = [item for item in row if item]
+                for event in events:
+                    if event in processed_row:
+                        value = float(processed_row[1].replace(',', ''))
+                        perf_data[event].append(value)
                 
-        else:
-            # --- Case 3: 1000-BIN BINNING (>4MB) ---
-            print(f"    -> Mode: Binning to {max_bins} bins (size > {very_large_threshold/1024/1024}MB).")
+        demand_data_rd_idx = events.index("OFFCORE_REQUESTS.DEMAND_DATA_RD")
+        cyc_demand_data_rd_idx = events.index("OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_DEMAND_DATA_RD")
+        l3_stall_idx = events.index("CYCLE_ACTIVITY.STALLS_L3_MISS")
+        cyc_idx = events.index("cycles")
 
-            num_bins = max_bins
-            bin_size = (var.size + num_bins - 1) // num_bins
-            bin_counts = [0] * num_bins
-            for addr, count in var.addr_stats.items():
-                offset = addr - var.start_addr
-                if 0 <= offset < var.size:
-                    bin_idx = min(offset // bin_size, num_bins - 1)
-                    bin_counts[bin_idx] += int(count)
+        demand_data_rd = np.asarray(perf_data[events[demand_data_rd_idx]])
+        cyc_demand_data_rd = np.asarray(perf_data[events[cyc_demand_data_rd_idx]])
+        l3_stall = np.asarray(perf_data[events[l3_stall_idx]])
+        cyc = np.asarray(perf_data[events[cyc_idx]])        
 
-            print(f"    -> Data preparation took: {time.time() - data_prep_start_time:.3f}s")
-            plotting_start_time = time.time()
+        a = 24.67
+        b = 0.87
+        l3_stall_per_cyc = l3_stall/cyc 
+        aol = cyc_demand_data_rd/demand_data_rd  #aol
+        slowdown = [l3_stall_per_cyc[i]/(a/aol[i]+b) for i in range(len(aol))] ## 预测减速
 
-            bin_offsets = [i * bin_size for i in range(num_bins)]
-            plt.figure(figsize=(12, 4))
-            plt.bar(bin_offsets, bin_counts, width=bin_size, align='edge')
+        flow_performance_pridict = l3_stall_per_cyc,aol,slowdown
+        return flow_performance_pridict
 
-            plt.title(f'Variable {var.var_id} @ {hex(var.start_addr)} L3 Miss Stall Heat Map ({num_bins} Bins)')
-            plt.ylabel(f'L3 Miss Stall Count per Bin (~{bin_size/1024:.1f}KB)')
+def getFactor(aol):
+    factor = 1
+    min_ratio = 0.03
+    max_ratio = 0.7
+    if aol < 80 and aol > 60:
+        factor = 2
+        min_ratio = 0.4
+        max_ratio = 0.6
+    elif aol <= 60 and aol > 45:
+        factor = 4
+    elif aol > 40:
+        factor = 8
+    else:
+        factor = 12
+    ret = factor,min_ratio,max_ratio
+    return ret
 
-            x_ticks = [0]
-            if num_bins > 1:
-                step = max(1, num_bins // 10)
-                x_ticks.extend([i * bin_size for i in range(step, num_bins, step)])
-            x_ticks.append(var.size)
-            plt.xticks(sorted(list(set(x_ticks))))
-            x_labels = [f"{int(x/1024)}K" for x in plt.gca().get_xticks()]
-            if len(x_labels) > 0:
-                x_labels[-1] = f"{int(var.size/1024)}K\n({hex(var.end_addr)})"
-            plt.gca().set_xticklabels(x_labels)
+def score(access_Ratio,predicted_perf,aol):
+    factor,min_ratio,max_ratio = getFactor(aol)
+    if access_Ratio >= max_ratio:
+        score = access_Ratio * predicted_perf / factor
+    elif access_Ratio >= min_ratio:
+        score = access_Ratio * predicted_perf 
+    else:
+        score = access_Ratio * predicted_perf * factor
+    return score
 
-            if any(bin_counts):
-                ymax = max(bin_counts) * 1.1
-                plt.ylim(0, ymax if ymax > 0 else 1)
-                plt.yticks(range(0, int(ymax) + 1, max(1, int(ymax) // 8)))
-                
-        # Common part for all plots
-        plt.xlim(0, var.size)
+
+#todo 用时间片访问比例替换全局访问比例
+def get_access_ratio_flow(flow_variables,flow_time_addr):
+    total_access_count = 0
+    for time, address in flow_time_addr:
+        for variable in flow_variables:
+            if variable.in_lifetime(time) and variable.contains(address):
+                for page in variable.pages:
+                    if page.contains(address):
+                        page.access_count += 1
+                        total_access_count += 1
+    for variable in flow_variables:
+        for page in variable.pages:
+            page.access_ratio = page.access_count / total_access_count
+    return  
+
+
+
+
+
+
+
+
+def get_page_sore_flow(flow_variables, flow_performance_pridiction):
+    l3_stall_per_cyc, aol, slowdown = flow_performance_pridiction
+    
+    # 遍历每个变量的页面
+    for variable in flow_variables:
+        total_page_score = 0
+        valid_time_slices = 0
         
-        total_stalls = var.stall_count
-        size_mb = var.size / (1024 * 1024)
-        plt.figtext(0.5, 0.01, f"Total L3 Miss Stall Count: {total_stalls}, Size: {size_mb:.3f} MB", ha="center", fontsize=12, bbox={"facecolor": "orange", "alpha": 0.2, "pad": 5})
-        plt.tight_layout(rect=[0, 0.05, 1, 1])
-        out_path = os.path.join(bar_dir, f'var_{var.var_id}_l3_stall.png')
-        plt.savefig(out_path)
-        plt.close()
-
-        print(f"    -> Plotting & saving took: {time.time() - plotting_start_time:.3f}s")
-        print(f"    -> Finished in {time.time() - var_start_time:.3f}s. Saved to: {out_path}")
-
-    print(f"\n[INFO] Finished generating all plots in {time.time() - total_start_time:.3f}s.")
-
-def analyze(peb_file, alloc_file, output_file):
-    variables = load_variables(alloc_file)
-    print(f"[INFO] Loaded {len(variables)} variable records")
-    
-    peb_count = 0
-    matched_peb_count = 0
-    
-    print(f"[INFO] Starting analysis of performance data file: {peb_file}")
-    with open(peb_file, 'r') as f:
-        for line in f:
-            parsed = parse_peb_line(line)
-            if parsed:
-                peb_count += 1
-                ts, addr = parsed
-                found = False
-                for var in variables:
-                    if var.in_lifetime(ts) and var.contains(addr):
-                        var.record_stall(addr)
-                        matched_peb_count += 1
-                        found = True
-                        break
-    
-    print(f"[INFO]Total of {peb_count} peb events, {matched_peb_count} matched to variables")
-    
-    with open(output_file, 'w') as out:
-        out.write('===== L3 Miss Stall Statistics Summary =====\n')
-        out.write('Start Address\tSize(Bytes)\tLifetime(ms)\tL3 Miss Stall Count\n')
-        for var in variables:
-            out.write(f'{hex(var.start_addr)}\t{var.size}\t{var.alloc_ts}~{var.free_ts}\t{var.stall_count}\n')
+        # 遍历每个页面
+        for page in variable.pages:
+            page_time_scores = []
+            
+            # 遍历每个时间片
+            for i in range(len(aol)):
+                # 检查页面是否在当前时间片的生命周期内
+                if variable.in_lifetime(i):
+                    # 根据AOL确定规模因子
+                    factor = 1
+                    min_ratio = 0.03
+                    max_ratio = 0.7
+                    
+                    if aol[i] < 80 and aol[i] > 60:
+                        factor = 2
+                        min_ratio = 0.4
+                        max_ratio = 0.6
+                    elif aol[i] <= 60 and aol[i] > 45:
+                        factor = 4
+                    elif aol[i] > 40:
+                        factor = 8
+                    else:
+                        factor = 12
+                    
+                    # 计算页面在当前时间片的得分
+                    if page.access_ratio >= max_ratio:
+                        time_slice_score = page.access_ratio * slowdown[i] / factor
+                    elif page.access_ratio >= min_ratio:
+                        time_slice_score = page.access_ratio * slowdown[i]
+                    else:
+                        time_slice_score = page.access_ratio * slowdown[i] * factor
+                    
+                    page_time_scores.append(time_slice_score)
+            
+            # 计算页面的平均得分
+            if page_time_scores:
+                page.score = sum(page_time_scores) / len(page_time_scores)
+                total_page_score += page.score
+                valid_time_slices += 1
         
-        out.write('\n===== Detailed L3 Miss Stalls per Variable =====\n')
-        for var in variables:
-            if var.stall_count == 0:
-                continue
-            out.write(f'\nVariable Start Address: {hex(var.start_addr)}\n')
-            out.write('Accessed Address\tL3 Miss Stall Count\n')
-            for addr, count in sorted(var.addr_stats.items()):
-                out.write(f'{hex(addr)}\t{count}\n')
+        # 如果变量在多个时间片内有效，计算变量的平均得分
+        if valid_time_slices > 0:
+            variable.score = total_page_score / valid_time_slices
     
-    print(f"[INFO] Statistics written to file: {output_file}")
-    plot_variable_stall_heat(variables, "result")
+    return flow_variables
+
+def sora(peb_file, perf_file, alloc_file, output_file):
+    flow_variables = File_Paser.load_variables(alloc_file)
+    print(f"[INFO] Loaded {len(flow_variables)} variable records")
+    
+    flow_time_addr = File_Paser.load_pebs_file(flow_variables, peb_file)
+    print(f"[INFO] Loaded pebs from file: {peb_file}")
+    
+    flow_performance_pridiction = File_Paser.load_stall_perf_file(perf_file)
+    print(f"[INFO] Loaded perf stall from file: {perf_file}")
+    
+    get_access_ratio_flow(flow_variables, flow_time_addr)
+    print(f"[INFO] Get access ratio by Fo and Fm")
+
+    flow_variables = get_page_sore_flow(flow_variables, flow_performance_pridiction)
+    
+    # 输出结果到文件
+    with open(output_file, 'w') as f:
+        for variable in flow_variables:
+            for page in variable.pages:
+                f.write(f"Variable: {variable.var_id}, Page Index: {page.idx}, "
+                        f"Access Ratio: {page.access_ratio}, Score: {page.score}\n")
+    
+    print(f"[INFO] Results written to {output_file}")
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4:
-        print("Usage: python3 analyze_l3_miss_stall.py <peb.txt> <alloc_info.txt> <output.txt>")
+    if len(sys.argv) != 5:
+        print("Usage: python3 analyze_l3_miss_stall.py <peb.txt> <perf.data> <alloc_info.txt> <output.txt>")
         sys.exit(1)
     peb_file = sys.argv[1]
-    alloc_file = sys.argv[2]
-    output_file = sys.argv[3]
-    analyze(peb_file, alloc_file, output_file) 
+    perf_file = sys.argv[2]
+    alloc_file = sys.argv[3]
+    output_file = sys.argv[4]
+    sora(peb_file, perf_file, alloc_file, output_file) 
