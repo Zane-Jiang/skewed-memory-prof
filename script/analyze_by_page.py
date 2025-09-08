@@ -11,17 +11,26 @@ import glob
 from collections import OrderedDict
 import csv
 
+events = ["cycles", "CYCLE_ACTIVITY.STALLS_L3_MISS", 
+  "OFFCORE_REQUESTS.DEMAND_DATA_RD", 
+  "OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_DEMAND_DATA_RD"]
+demand_data_rd_idx = events.index("OFFCORE_REQUESTS.DEMAND_DATA_RD")
+cyc_demand_data_rd_idx = events.index("OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_DEMAND_DATA_RD")
+l3_stall_idx = events.index("CYCLE_ACTIVITY.STALLS_L3_MISS")
+cyc_idx = events.index("cycles")
 
 PAGE_SIZE = 4*1024
 class Page:
-    def __init__(self,idx,start_addr):
+    def __init__(self, idx, start_addr):
         self.access_count = 0
         self.idx = idx
         self.start_addr = start_addr
         self.access_ratio = 0.0
         self.score = 0.0
+        self.time_slice_access_counts = []
+        self.time_slice_access_ratios = []
         
-    def contains(self,addr):
+    def contains(self, addr):
         return self.start_addr <= addr <= (self.start_addr+PAGE_SIZE)
         
 class Variable:
@@ -46,14 +55,14 @@ class Variable:
     def contains(self, addr):
         return self.start_addr <= addr < self.end_addr
 
-events = ["cycles", "CYCLE_ACTIVITY.STALLS_L3_MISS", \
-  "OFFCORE_REQUESTS.DEMAND_DATA_RD", \
-  "OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_DEMAND_DATA_RD"]
 class File_Paser:
     @staticmethod
     def load_variables(alloc_file):
+        start_time = 0
+        end_time = 0
         variables = []
         with open(alloc_file, 'r') as f:
+            #todo 
             for line in f:
                 line = line.strip()
                 if line == '' or line.startswith('#'):
@@ -70,7 +79,7 @@ class File_Paser:
                     free_ts=parts[5]
                 )
                 variables.append(var)
-        return variables
+        return start_time,end_time,variables
     
 
     def __parse_peb_line(line):
@@ -93,8 +102,6 @@ class File_Paser:
                     flow_time_addr.append(parsed)
         return flow_time_addr
 
-
-
     @staticmethod 
     def load_stall_perf_file(file_name):
         perf_data = OrderedDict()
@@ -102,7 +109,6 @@ class File_Paser:
             perf_data[event] = []
 
         with open(file_name) as csv_file:
-        # Process the file content here
             csv_header = csv.reader(csv_file, delimiter=' ')
             line_count = 0
             for row in csv_header:
@@ -113,11 +119,6 @@ class File_Paser:
                         value = float(processed_row[1].replace(',', ''))
                         perf_data[event].append(value)
                 
-        demand_data_rd_idx = events.index("OFFCORE_REQUESTS.DEMAND_DATA_RD")
-        cyc_demand_data_rd_idx = events.index("OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_DEMAND_DATA_RD")
-        l3_stall_idx = events.index("CYCLE_ACTIVITY.STALLS_L3_MISS")
-        cyc_idx = events.index("cycles")
-
         demand_data_rd = np.asarray(perf_data[events[demand_data_rd_idx]])
         cyc_demand_data_rd = np.asarray(perf_data[events[cyc_demand_data_rd_idx]])
         l3_stall = np.asarray(perf_data[events[l3_stall_idx]])
@@ -129,51 +130,50 @@ class File_Paser:
         aol = cyc_demand_data_rd/demand_data_rd  #aol
         slowdown = [l3_stall_per_cyc[i]/(a/aol[i]+b) for i in range(len(aol))] ## 预测减速
 
-        flow_performance_pridict = l3_stall_per_cyc,aol,slowdown
-        return flow_performance_pridict
-
-def getFactor(aol):
-    factor = 1
-    min_ratio = 0.03
-    max_ratio = 0.7
-    if aol < 80 and aol > 60:
-        factor = 2
-        min_ratio = 0.4
-        max_ratio = 0.6
-    elif aol <= 60 and aol > 45:
-        factor = 4
-    elif aol > 40:
-        factor = 8
-    else:
-        factor = 12
-    ret = factor,min_ratio,max_ratio
-    return ret
-
-def score(access_Ratio,predicted_perf,aol):
-    factor,min_ratio,max_ratio = getFactor(aol)
-    if access_Ratio >= max_ratio:
-        score = access_Ratio * predicted_perf / factor
-    elif access_Ratio >= min_ratio:
-        score = access_Ratio * predicted_perf 
-    else:
-        score = access_Ratio * predicted_perf * factor
-    return score
+        flow_performance_pridiction = l3_stall_per_cyc,aol,slowdown
+        return flow_performance_pridiction
 
 
-#todo 用时间片访问比例替换全局访问比例
-def get_access_ratio_flow(flow_variables,flow_time_addr):
-    total_access_count = 0
+def get_access_ratio_flow(new_ts, flow_variables, flow_time_addr):
+    # 为每个变量和页面初始化时间片访问计数
+    for variable in flow_variables:
+        for page in variable.pages:
+            page.time_slice_access_counts = [0] * len(new_ts)
+            page.time_slice_access_ratios = [0.0] * len(new_ts)
+
+    # 遍历每个时间地址对
     for time, address in flow_time_addr:
+        # 找到对应的时间片索引
+        time_slice_idx = next((i for i, ts_end in enumerate(new_ts) if time < ts_end), len(new_ts) - 1)
+        
+        # 检查地址是否属于某个变量和页面
         for variable in flow_variables:
             if variable.in_lifetime(time) and variable.contains(address):
                 for page in variable.pages:
                     if page.contains(address):
-                        page.access_count += 1
-                        total_access_count += 1
+                        page.time_slice_access_counts[time_slice_idx] += 1
+
+    # 计算每个时间片的总访问次数
+    time_slice_total_access_counts = [0] * len(new_ts)
     for variable in flow_variables:
         for page in variable.pages:
-            page.access_ratio = page.access_count / total_access_count
-    return  
+            for i in range(len(new_ts)):
+                time_slice_total_access_counts[i] += page.time_slice_access_counts[i]
+
+    # 计算每个页面在每个时间片的访问比例
+    for variable in flow_variables:
+        for page in variable.pages:
+            for i in range(len(new_ts)):
+                # 避免除零错误
+                if time_slice_total_access_counts[i] > 0:
+                    page.time_slice_access_ratios[i] = page.time_slice_access_counts[i] / time_slice_total_access_counts[i]
+                else:
+                    page.time_slice_access_ratios[i] = 0.0
+
+            page.access_count = sum(page.time_slice_access_counts)
+            page.access_ratio = page.access_count / sum(time_slice_total_access_counts) if sum(time_slice_total_access_counts) > 0 else 0.0
+
+    return
 
 
 
@@ -187,8 +187,6 @@ def get_page_sore_flow(flow_variables, flow_performance_pridiction):
     
     # 遍历每个变量的页面
     for variable in flow_variables:
-        total_page_score = 0
-        valid_time_slices = 0
         
         # 遍历每个页面
         for page in variable.pages:
@@ -214,39 +212,42 @@ def get_page_sore_flow(flow_variables, flow_performance_pridiction):
                     else:
                         factor = 12
                     
+                    # 使用时间片访问比例计算得分
+                    access_ratio = page.time_slice_access_ratios[i] if i < len(page.time_slice_access_ratios) else 0.0
+                    
                     # 计算页面在当前时间片的得分
-                    if page.access_ratio >= max_ratio:
-                        time_slice_score = page.access_ratio * slowdown[i] / factor
-                    elif page.access_ratio >= min_ratio:
-                        time_slice_score = page.access_ratio * slowdown[i]
+                    if access_ratio >= max_ratio:
+                        time_slice_score = access_ratio * slowdown[i] / factor
+                    elif access_ratio >= min_ratio:
+                        time_slice_score = access_ratio * slowdown[i]
                     else:
-                        time_slice_score = page.access_ratio * slowdown[i] * factor
+                        time_slice_score = access_ratio * slowdown[i] * factor
                     
                     page_time_scores.append(time_slice_score)
             
-            # 计算页面的平均得分
+            # 计算页面的总得分
             if page_time_scores:
-                page.score = sum(page_time_scores) / len(page_time_scores)
-                total_page_score += page.score
-                valid_time_slices += 1
-        
-        # 如果变量在多个时间片内有效，计算变量的平均得分
-        if valid_time_slices > 0:
-            variable.score = total_page_score / valid_time_slices
-    
+                page.score = sum(page_time_scores) 
     return flow_variables
 
 def sora(peb_file, perf_file, alloc_file, output_file):
-    flow_variables = File_Paser.load_variables(alloc_file)
+    start_time,end_time,flow_variables = File_Paser.load_variables(alloc_file)
     print(f"[INFO] Loaded {len(flow_variables)} variable records")
     
     flow_time_addr = File_Paser.load_pebs_file(flow_variables, peb_file)
     print(f"[INFO] Loaded pebs from file: {peb_file}")
     
     flow_performance_pridiction = File_Paser.load_stall_perf_file(perf_file)
+    l3_stall_per_cyc,aol,slowdown = flow_performance_pridiction
+    
+
+    perf_interval  = (end_time-start_time)/len(l3_stall_per_cyc)
+    new_ts = [t for t in range(int(start_time), int(end_time), perf_interval)]
+    new_ts = new_ts[:-1]
+
     print(f"[INFO] Loaded perf stall from file: {perf_file}")
     
-    get_access_ratio_flow(flow_variables, flow_time_addr)
+    get_access_ratio_flow(new_ts,flow_variables, flow_time_addr)
     print(f"[INFO] Get access ratio by Fo and Fm")
 
     flow_variables = get_page_sore_flow(flow_variables, flow_performance_pridiction)
@@ -262,7 +263,7 @@ def sora(peb_file, perf_file, alloc_file, output_file):
 
 if __name__ == '__main__':
     if len(sys.argv) != 5:
-        print("Usage: python3 analyze_l3_miss_stall.py <peb.txt> <perf.data> <alloc_info.txt> <output.txt>")
+        print("Usage: python3 analyze_by_page.py <peb.txt> <perf.data> <alloc_info.txt> <output.txt>")
         sys.exit(1)
     peb_file = sys.argv[1]
     perf_file = sys.argv[2]
