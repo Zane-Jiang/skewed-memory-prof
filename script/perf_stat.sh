@@ -18,7 +18,6 @@ perf_collect_l3_store_miss() {
   dir=$(basename "$program")
   init_output_dir "$dir"
 
-  
   "$program" "$@" 2>&1 > ${OUT_RAW_DIR}/"$dir"/log &
   cpid=$!
   sleep 1
@@ -48,6 +47,7 @@ perf_collect_l3_store_miss() {
 
   mkdir -p rst/analyze
   echo "running analyze_by_page.py"
+  echo "[commond]python3 /home/jz/PCXL/benchmark/skewed-memory-prof/script/analyze_by_page.py "$OUT_RAW_DIR/"$dir"/pebs.txt"  "$OUT_RAW_DIR/"$dir"/perf.data" "$HEAP_PROF_PATH" "result/"$dir".txt""
   python3 /home/jz/PCXL/benchmark/skewed-memory-prof/script/analyze_by_page.py "$OUT_RAW_DIR/"$dir"/pebs.txt"  "$OUT_RAW_DIR/"$dir"/perf.data" "$HEAP_PROF_PATH" "result/"$dir".txt"
 }
 

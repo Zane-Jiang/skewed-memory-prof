@@ -3,13 +3,18 @@
 import re
 import sys
 from collections import defaultdict
-import matplotlib.pyplot as plt
-import numpy as np
 import os
 import time
 import glob
 from collections import OrderedDict
 import csv
+import numpy as np
+import bisect
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 events = ["cycles", "CYCLE_ACTIVITY.STALLS_L3_MISS", 
   "OFFCORE_REQUESTS.DEMAND_DATA_RD", 
@@ -19,7 +24,7 @@ cyc_demand_data_rd_idx = events.index("OFFCORE_REQUESTS_OUTSTANDING.CYCLES_WITH_
 l3_stall_idx = events.index("CYCLE_ACTIVITY.STALLS_L3_MISS")
 cyc_idx = events.index("cycles")
 
-PAGE_SIZE = 4*1024
+PAGE_SIZE = 2*1024*1024
 class Page:
     def __init__(self, idx, start_addr):
         self.access_count = 0
@@ -39,8 +44,8 @@ class Variable:
         self.start_addr = int(ptr, 16)
         self.end_addr = self.start_addr + int(size)
         self.size = int(size)
-        self.alloc_ts = float(alloc_ts)
-        self.free_ts = float(free_ts)
+        self.alloc_ts = int(alloc_ts)
+        self.free_ts = int(free_ts)
         self.location = location
 
         end_pg   = (self.size) // PAGE_SIZE
@@ -58,8 +63,6 @@ class Variable:
 class File_Paser:
     @staticmethod
     def load_variables(alloc_file):
-        start_time = 0
-        end_time = 0
         variables = []
         with open(alloc_file, 'r') as f:
             #todo 
@@ -79,6 +82,15 @@ class File_Paser:
                     free_ts=parts[5]
                 )
                 variables.append(var)
+        
+        # 计算开始和结束时间
+        if variables:
+            start_time = min(var.alloc_ts for var in variables)
+            end_time = max(var.free_ts for var in variables)
+        else:
+            start_time = 0
+            end_time = 0
+            
         return start_time,end_time,variables
     
 
@@ -130,119 +142,234 @@ class File_Paser:
         aol = cyc_demand_data_rd/demand_data_rd  #aol
         slowdown = [l3_stall_per_cyc[i]/(a/aol[i]+b) for i in range(len(aol))] ## 预测减速
 
-        flow_performance_pridiction = l3_stall_per_cyc,aol,slowdown
+        flow_performance_pridiction = aol,slowdown
         return flow_performance_pridiction
 
 
+def _process_chunk(args):
+    chunk, thresholds, simple_vars = args
+    num_t = len(thresholds)
+    from collections import defaultdict
+    local_counts = defaultdict(lambda: np.zeros(num_t, dtype=np.int64))
+
+    for time_val, address in chunk:
+        idx = bisect.bisect_right(thresholds, time_val)
+        if idx >= num_t:
+            idx = num_t - 1
+
+        for v_idx, (alloc_ts, free_ts, var_start, var_end, page_starts) in enumerate(simple_vars):
+            if not (alloc_ts <= time_val <= free_ts):
+                continue
+            if not (var_start <= address < var_end):
+                continue
+
+            page_idx = (address - var_start) // PAGE_SIZE
+            if 0 <= page_idx < len(page_starts):
+                local_counts[(v_idx, int(page_idx))][idx] += 1
+
+    return {k: v.tolist() for k, v in local_counts.items()}
+
+
 def get_access_ratio_flow(new_ts, flow_variables, flow_time_addr):
-    # 为每个变量和页面初始化时间片访问计数
     for variable in flow_variables:
         for page in variable.pages:
             page.time_slice_access_counts = [0] * len(new_ts)
             page.time_slice_access_ratios = [0.0] * len(new_ts)
 
-    # 遍历每个时间地址对
-    for time, address in flow_time_addr:
-        # 找到对应的时间片索引
-        time_slice_idx = next((i for i, ts_end in enumerate(new_ts) if time < ts_end), len(new_ts) - 1)
-        
-        # 检查地址是否属于某个变量和页面
-        for variable in flow_variables:
-            if variable.in_lifetime(time) and variable.contains(address):
-                for page in variable.pages:
-                    if page.contains(address):
-                        page.time_slice_access_counts[time_slice_idx] += 1
+    if not flow_time_addr:
+        return
 
-    # 计算每个时间片的总访问次数
-    time_slice_total_access_counts = [0] * len(new_ts)
+    # 构建轻量级变量元数据，便于多进程传输
+    simple_vars = []
     for variable in flow_variables:
-        for page in variable.pages:
-            for i in range(len(new_ts)):
-                time_slice_total_access_counts[i] += page.time_slice_access_counts[i]
+        page_starts = [p.start_addr for p in variable.pages]
+        simple_vars.append((
+            variable.alloc_ts,
+            variable.free_ts,
+            variable.start_addr,
+            variable.end_addr,
+            page_starts,
+        ))
 
-    # 计算每个页面在每个时间片的访问比例
-    for variable in flow_variables:
-        for page in variable.pages:
-            for i in range(len(new_ts)):
-                # 避免除零错误
-                if time_slice_total_access_counts[i] > 0:
-                    page.time_slice_access_ratios[i] = page.time_slice_access_counts[i] / time_slice_total_access_counts[i]
+    num_workers = max(1, (multiprocessing.cpu_count() or 1))
+    chunk_size = max(1, len(flow_time_addr) // (num_workers * 4) or 1)
+    chunks = [flow_time_addr[i:i + chunk_size] for i in range(0, len(flow_time_addr), chunk_size)]
+
+    aggregated = {}
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_process_chunk, (chunk, new_ts, simple_vars)) for chunk in chunks]
+        for fut in as_completed(futures):
+            part = fut.result()
+            for key, arr in part.items():
+                if key not in aggregated:
+                    aggregated[key] = np.array(arr, dtype=np.int64)
                 else:
-                    page.time_slice_access_ratios[i] = 0.0
+                    aggregated[key] += np.array(arr, dtype=np.int64)
 
-            page.access_count = sum(page.time_slice_access_counts)
-            page.access_ratio = page.access_count / sum(time_slice_total_access_counts) if sum(time_slice_total_access_counts) > 0 else 0.0
+    for (v_idx, p_idx), counts in aggregated.items():
+        page = flow_variables[v_idx].pages[p_idx]
+        page.time_slice_access_counts = counts.tolist()
+
+    time_slice_total_access_counts = np.zeros(len(new_ts), dtype=np.int64)
+    for variable in flow_variables:
+        for page in variable.pages:
+            time_slice_total_access_counts += np.array(page.time_slice_access_counts, dtype=np.int64)
+
+    total_sum = int(time_slice_total_access_counts.sum())
+
+    # 计算每页各时间片的访问比例与整体占比
+    for variable in flow_variables:
+        for page in variable.pages:
+            if time_slice_total_access_counts.any():
+                ratios = np.divide(
+                    np.array(page.time_slice_access_counts, dtype=np.float64),
+                    time_slice_total_access_counts,
+                    out=np.zeros_like(time_slice_total_access_counts, dtype=np.float64),
+                    where=time_slice_total_access_counts > 0,
+                )
+                page.time_slice_access_ratios = ratios.tolist()
+            else:
+                page.time_slice_access_ratios = [0.0] * len(new_ts)
+
+            page.access_count = int(sum(page.time_slice_access_counts))
+            page.access_ratio =  (page.access_count / total_sum) if total_sum > 0 else 0.0
 
     return
 
 
+def _score_page(args):
+    v_idx, p_idx, alloc_ts, free_ts, ratios, new_ts, aol, slowdown = args
+    page_time_scores = []
+    for i in range(len(new_ts)):
+        ts_val = new_ts[i]
+        if not (alloc_ts <= ts_val <= free_ts):
+            continue
+        factor = 1
+        min_ratio = 0.000003
+        max_ratio = 0.0007
+        ai = aol[i] if i < len(aol) else aol[-1]
+        if ai < 80 and ai > 60:
+            factor = 2
+            min_ratio = 0.4
+            max_ratio = 0.6
+        elif ai <= 60 and ai > 45:
+            factor = 4
+        elif ai > 40:
+            factor = 8
+        else:
+            factor = 12
+        access_ratio = ratios[i] if i < len(ratios) else 0.0
+        if access_ratio >= max_ratio:
+            time_slice_score = access_ratio * slowdown[i] / factor
+        elif access_ratio >= min_ratio:
+            time_slice_score = access_ratio * slowdown[i]
+        else:
+            time_slice_score = access_ratio * slowdown[i] * factor
+        # page_time_scores.append(time_slice_score)
+        page_time_scores.append(access_ratio*1)
+    score = sum(page_time_scores) if page_time_scores else 0.0
+    return (v_idx, p_idx, score)
 
 
-
-
-
-
-def get_page_sore_flow(flow_variables, flow_performance_pridiction):
-    l3_stall_per_cyc, aol, slowdown = flow_performance_pridiction
-    
-    # 遍历每个变量的页面
-    for variable in flow_variables:
-        
-        # 遍历每个页面
-        for page in variable.pages:
-            page_time_scores = []
-            
-            # 遍历每个时间片
-            for i in range(len(aol)):
-                # 检查页面是否在当前时间片的生命周期内
-                if variable.in_lifetime(i):
-                    # 根据AOL确定规模因子
-                    factor = 1
-                    min_ratio = 0.03
-                    max_ratio = 0.7
-                    
-                    if aol[i] < 80 and aol[i] > 60:
-                        factor = 2
-                        min_ratio = 0.4
-                        max_ratio = 0.6
-                    elif aol[i] <= 60 and aol[i] > 45:
-                        factor = 4
-                    elif aol[i] > 40:
-                        factor = 8
-                    else:
-                        factor = 12
-                    
-                    # 使用时间片访问比例计算得分
-                    access_ratio = page.time_slice_access_ratios[i] if i < len(page.time_slice_access_ratios) else 0.0
-                    
-                    # 计算页面在当前时间片的得分
-                    if access_ratio >= max_ratio:
-                        time_slice_score = access_ratio * slowdown[i] / factor
-                    elif access_ratio >= min_ratio:
-                        time_slice_score = access_ratio * slowdown[i]
-                    else:
-                        time_slice_score = access_ratio * slowdown[i] * factor
-                    
-                    page_time_scores.append(time_slice_score)
-            
-            # 计算页面的总得分
-            if page_time_scores:
-                page.score = sum(page_time_scores) 
+def get_page_sore_flow(new_ts,flow_variables, flow_performance_pridiction):
+    aol, slowdown = flow_performance_pridiction
+    tasks = []
+    for v_idx, variable in enumerate(flow_variables):
+        for p_idx, page in enumerate(variable.pages):
+            tasks.append((
+                v_idx,
+                p_idx,
+                variable.alloc_ts,
+                variable.free_ts,
+                page.time_slice_access_ratios,
+                new_ts,
+                aol,
+                slowdown,
+            ))
+    if not tasks:
+        return flow_variables
+    num_workers = max(1, (multiprocessing.cpu_count() or 1))
+    results = []
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # 均匀切块分配，避免任务过小
+        chunk = max(1, len(tasks)//(num_workers*4) or 1)
+        for res in executor.map(_score_page, tasks, chunksize=chunk):
+            results.append(res)
+    for v_idx, p_idx, score in results:
+        flow_variables[v_idx].pages[p_idx].score = score
     return flow_variables
+
+def _plot_variable_batch(args):
+    variable_batch, output_dir = args
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    
+    saved_paths = []
+    for var_id, page_scores in variable_batch:
+        if not page_scores:
+            continue
+            
+        page_indices = list(range(len(page_scores)))
+        figure_width = min(max(len(page_scores) * 0.25 + 2.0, 6.0), 32.0)
+        
+        fig = plt.figure(figsize=(figure_width, 4.5), dpi=100)
+        ax = fig.add_subplot(1, 1, 1)
+        ax.bar(page_indices, page_scores, color='#4C78A8', width=0.8)
+        ax.set_xlabel('Subpage Index')
+        ax.set_ylabel('Page Score (x100)')
+        ax.set_title(f'Variable {var_id}')
+        
+        safe_var_id = str(var_id).replace('/', '_').replace('\\', '_').replace(' ', '_')
+        out_path = os.path.join(output_dir, f"var_{safe_var_id}_page_scores.png")
+        fig.savefig(out_path, bbox_inches='tight', pad_inches=0.1)
+        plt.close(fig)
+        print(f"[INFO] Saved plot for variable {var_id} to {out_path}") 
+        saved_paths.append(out_path)
+    
+    return saved_paths
+
+
+def plot_variable_page_scores(flow_variables, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    plot_data = []
+    for variable in flow_variables:
+        if variable.size <= PAGE_SIZE:
+            continue
+        scores = [page.score * 100.0 for page in variable.pages]
+        if scores:
+            plot_data.append((variable.var_id, scores))
+    
+    if not plot_data:
+        return
+    
+    num_workers = min(8, (multiprocessing.cpu_count() or 1))
+    batch_size = max(1, len(plot_data) // num_workers)
+    batches = [plot_data[i:i + batch_size] for i in range(0, len(plot_data), batch_size)]
+    
+    num_workers = min(num_workers, len(batches))
+    
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        tasks = [(batch, output_dir) for batch in batches]
+        for result in executor.map(_plot_variable_batch, tasks):
+            if result:
+                continue
 
 def sora(peb_file, perf_file, alloc_file, output_file):
     start_time,end_time,flow_variables = File_Paser.load_variables(alloc_file)
     print(f"[INFO] Loaded {len(flow_variables)} variable records")
     
+
     flow_time_addr = File_Paser.load_pebs_file(flow_variables, peb_file)
     print(f"[INFO] Loaded pebs from file: {peb_file}")
     
     flow_performance_pridiction = File_Paser.load_stall_perf_file(perf_file)
-    l3_stall_per_cyc,aol,slowdown = flow_performance_pridiction
+    aol,slowdown = flow_performance_pridiction
     
 
-    perf_interval  = (end_time-start_time)/len(l3_stall_per_cyc)
-    new_ts = [t for t in range(int(start_time), int(end_time), perf_interval)]
+    perf_interval  = int(int(end_time)-int(start_time))/len(aol)
+    new_ts = [t for t in range(int(start_time), int(end_time), int(perf_interval))]
     new_ts = new_ts[:-1]
 
     print(f"[INFO] Loaded perf stall from file: {perf_file}")
@@ -250,16 +377,40 @@ def sora(peb_file, perf_file, alloc_file, output_file):
     get_access_ratio_flow(new_ts,flow_variables, flow_time_addr)
     print(f"[INFO] Get access ratio by Fo and Fm")
 
-    flow_variables = get_page_sore_flow(flow_variables, flow_performance_pridiction)
+    flow_variables = get_page_sore_flow(new_ts,flow_variables, flow_performance_pridiction)
     
-    # 输出结果到文件
+    all_page_scores = [page.score for variable in flow_variables for page in variable.pages if variable.size > PAGE_SIZE]
+    avg_score_threshold = sum(all_page_scores) / len(all_page_scores) if all_page_scores else 0.0
+    print(f"[INFO] Average page score threshold: {avg_score_threshold}")
+
+    if not os.path.exists(output_file):
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    i = 0    
+    bitmap_dir = os.path.dirname(output_file)
+    bitmap_file = os.path.join(bitmap_dir, f"_bitmap.txt")
     with open(output_file, 'w') as f:
-        for variable in flow_variables:
-            for page in variable.pages:
-                f.write(f"Variable: {variable.var_id}, Page Index: {page.idx}, "
+        with open(bitmap_file, 'w') as bf:
+            for variable in flow_variables:
+                if variable.size <= PAGE_SIZE:
+                    continue
+            
+                bitmap = [1 if page.score > avg_score_threshold else 0 for page in variable.pages]
+                if all(b == 0 for b in bitmap) or all(b == 1 for b in bitmap):
+                    print(f"[WARN] Variable_{i}: {variable.var_id} bitmap is all {bitmap[0]}")
+                else:
+                    bf.write(f"Variable_{i}: {variable.var_id}, Bitmap: {bitmap}\n".join(map(str, bitmap)) + '\n')
+                for page in variable.pages:
+                    f.write(f"Variable_{i}: {variable.var_id}, Page Index: {page.idx}, "
                         f"Access Ratio: {page.access_ratio}, Score: {page.score}\n")
-    
+                i += 1
+
     print(f"[INFO] Results written to {output_file}")
+
+    plots_dir = os.path.join(os.path.dirname(output_file.split('.')[0]), 'plots')
+    plot_variable_page_scores(flow_variables, plots_dir)
+    print(f"[INFO] Plots written to {plots_dir}")
+
+    
 
 if __name__ == '__main__':
     if len(sys.argv) != 5:
