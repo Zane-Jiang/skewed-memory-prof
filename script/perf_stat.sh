@@ -24,7 +24,7 @@ perf_collect_l3_store_miss() {
   gpid=$cpid
   echo "[INFO] gpid[$gpid],start perf record."
 
-
+  sudo rm -rf ${OUT_RAW_DIR}/"$dir"/perf.data
   $PERF record -d  -e mem_load_retired.l3_miss:pp  -e pebs:pebs -c 3001 -p $gpid -o ${OUT_RAW_DIR}/"$dir"/pebs.data &
   pebs_pid=$!
 

@@ -39,7 +39,7 @@ class Page:
         return self.start_addr <= addr <= (self.start_addr+PAGE_SIZE)
         
 class Variable:
-    def __init__(self, var_id, ptr, location, size, alloc_ts, free_ts):
+    def __init__(self, var_id, ptr, location, size, alloc_ts, free_ts,index):
         self.var_id = var_id
         self.start_addr = int(ptr, 16)
         self.end_addr = self.start_addr + int(size)
@@ -47,12 +47,17 @@ class Variable:
         self.alloc_ts = int(alloc_ts)
         self.free_ts = int(free_ts)
         self.location = location
+        self.index = index
+        self.score = 0.0
 
         end_pg   = (self.size) // PAGE_SIZE
         self.pages = []
         for p in range(0, end_pg + 1):
             self.pages.append(Page(idx=p, start_addr=self.start_addr + p * PAGE_SIZE))
 
+    def calculate_score(self):
+        self.score = sum(page.score for page in self.pages)
+        self.score = self.score / self.size if self.size > 0 else 0.0
 
     def in_lifetime(self, ts):
         return self.alloc_ts <= ts <= self.free_ts
@@ -65,7 +70,8 @@ class File_Paser:
     def load_variables(alloc_file):
         variables = []
         with open(alloc_file, 'r') as f:
-            #todo 
+            
+            index = 0
             for line in f:
                 line = line.strip()
                 if line == '' or line.startswith('#'):
@@ -79,8 +85,10 @@ class File_Paser:
                     location=parts[2],
                     size=parts[3],
                     alloc_ts=parts[4],
-                    free_ts=parts[5]
+                    free_ts=parts[5],
+                    index=index
                 )
+                index += 1
                 variables.append(var)
         
         # 计算开始和结束时间
@@ -240,6 +248,8 @@ def get_access_ratio_flow(new_ts, flow_variables, flow_time_addr):
 def _score_page(args):
     v_idx, p_idx, alloc_ts, free_ts, ratios, new_ts, aol, slowdown = args
     page_time_scores = []
+    if v_idx == 4:
+        print(f"[DEBUG] Scoring Variable {v_idx} Page {p_idx}, alloc_ts: {alloc_ts}, free_ts: {free_ts}")
     for i in range(len(new_ts)):
         ts_val = new_ts[i]
         if not (alloc_ts <= ts_val <= free_ts):
@@ -268,6 +278,8 @@ def _score_page(args):
         # page_time_scores.append(time_slice_score)
         page_time_scores.append(access_ratio*1)
     score = sum(page_time_scores) if page_time_scores else 0.0
+    if v_idx == 4:
+        print(f"[DEBUG] Variable {v_idx} Page {p_idx} Score: {score}")
     return (v_idx, p_idx, score)
 
 
@@ -318,7 +330,7 @@ def _plot_variable_batch(args):
         ax.bar(page_indices, page_scores, color='#4C78A8', width=0.8)
         ax.set_xlabel('Subpage Index')
         ax.set_ylabel('Page Score (x100)')
-        ax.set_title(f'Variable {var_id}')
+        ax.set_title(f'Variable index{var_id} ')
         
         safe_var_id = str(var_id).replace('/', '_').replace('\\', '_').replace(' ', '_')
         out_path = os.path.join(output_dir, f"var_{safe_var_id}_page_scores.png")
@@ -328,6 +340,17 @@ def _plot_variable_batch(args):
         saved_paths.append(out_path)
     
     return saved_paths
+
+# def merge_value(flow_variables):
+#     ret = set()
+#     id_map = {}
+#     for variable in flow_variables:
+#         if variable.var_id not in id_map:
+#             variable.calculate_score()
+#             id_map[variable.var_id] = variable
+#     #sora 这里存在bug，相同的id就使用了相同的variable对象，导致前边score被覆盖，用一个socre表示所有socre
+#     ret = set(id_map.values())
+#     return ret
 
 
 def plot_variable_page_scores(flow_variables, output_dir):
@@ -339,7 +362,7 @@ def plot_variable_page_scores(flow_variables, output_dir):
             continue
         scores = [page.score * 100.0 for page in variable.pages]
         if scores:
-            plot_data.append((variable.var_id, scores))
+            plot_data.append((variable.index, scores))
     
     if not plot_data:
         return
@@ -381,6 +404,7 @@ def sora(peb_file, perf_file, alloc_file, output_file):
     
     all_page_scores = [page.score for variable in flow_variables for page in variable.pages if variable.size > PAGE_SIZE]
     avg_score_threshold = sum(all_page_scores) / len(all_page_scores) if all_page_scores else 0.0
+    avg_score_threshold  /= 100.0  # 调整阈值，避免过高
     print(f"[INFO] Average page score threshold: {avg_score_threshold}")
 
     if not os.path.exists(output_file):
